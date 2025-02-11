@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 import torch.nn.functional as F
 import torchvision.transforms as transforms
 from PIL import ImageFile, Image
+import cv2
 from utils import read_tiff, get_data
 from graph_construction import calcADJ
 from collections import defaultdict as dfd
@@ -367,7 +368,7 @@ class ViT_SKIN(torch.utils.data.Dataset):
 class ViT_DLPFC(torch.utils.data.Dataset):
     def __init__(self, train=True, gene_list=None, ds=None, sr=False, aug=False, norm=False, fold=0):
         super(ViT_DLPFC, self).__init__()
-        self.dir = './data/st_data/DLPFC_new/'
+        self.dir = './data/st_data/DLPFC12/'
         self.r = 224 // 4
 
         sample_names = ['151507', '151508', '151509', 
@@ -511,23 +512,31 @@ class ViT_DLPFC(torch.utils.data.Dataset):
         return len(self.exp_dict)
 
     def get_img(self, name):
-        # path = f'{self.dir}/{name}/spatial/{name}_full_image.tif'
+        # path = f'{self.dir}/{name}/{name}_full_image.tif'
         path = os.path.join(self.dir, name, 'spatial', 'tissue_hires_image.png')
         im = Image.open(path)
         return im
 
     def get_meta(self, name, gene_list=None):
-        meta = pd.read_csv(f'{self.dir}{name}/metadata.tsv', index_col=0)
+        meta = pd.read_csv(f'{self.dir}{name}/metadata.tsv', index_col=0, sep='\t')
         return meta
     
-    def get_expression_data(self, name):
+    def get_adata(self, name):
         h5_path = os.path.join(self.dir, name)
-        adata = sc.read_visium(h5_path, count_file='filtered_feature_bc_matrix.h5')
+        adata = sc.read_visium(h5_path, count_file=name+'_filtered_feature_bc_matrix.h5', load_images=True)
+        adata.var_names_make_unique()
+        
+        gt_df = self.get_labels(name)
+        adata.obs['gt_clusters'] = gt_df.loc[:, 6] # Last column
+        
+        # Drop na
+        adata = adata[adata.obs.dropna().index].copy()
+        adata['gt_clusters'] = adata.obs['gt_clusters'].astype(int).astype(str)
         return adata
     
     def get_spatial_positions(self, name):
         pos_path = os.path.join(self.dir, name, 'spatial', 'tissue_positions_list.csv')
-        positions = pd.read_csv(pos_path, header=None)
+        positions = pd.read_csv(pos_path, header=None, index_col=0)
         positions.columns = ['barcode', 'in_tissue', 'array_row', 'array_col', 'pxl_col_in_fullres', 'pxl_row_in_fullres']
         return positions
 
@@ -536,3 +545,145 @@ class ViT_DLPFC(torch.utils.data.Dataset):
         for i in meta_dict.values():
             gene_set = gene_set & set(i.columns)
         return list(gene_set)
+    
+    def get_labels(self, name):
+        gt_dir = os.path.join(self.dir, name, 'gt')
+        gt_df = pd.read_csv(os.path.join(gt_dir, 'tissue_positions_list_GTs.txt'),
+                            header=None, sep=',', index_col=0)
+        return gt_df
+
+        
+class MyDataset(torch.utils.data.Dataset):
+    def __init__(self, dataset, section_id, train=False, aug=False, norm=False, gene_list=None):
+        super(MyDataset, self).__init__()
+
+        self.r = 224 // 4
+        self.train = train
+        self.aug = aug
+        self.norm = norm
+        self.gene_list = gene_list
+        self.transforms = transforms.Compose([
+            transforms.ColorJitter(0.5, 0.5, 0.5), 
+            transforms.ToTensor()
+        ])        
+
+        if dataset.lower() == 'dlpfc':
+            self.dir = './data/st_data/DLPFC12/'
+            
+            # Load data
+            print('Loading data...')
+            self.adata = self.get_adata(section_id)
+            full_img = np.array(self.get_img(section_id))
+
+            self.spatial = self.adata.obsm['spatial']
+            self.patches = np.array([
+                full_img[x - self.r:x + self.r, y - self.r:y + self.r, :]
+                for x, y in self.spatial
+            ])
+            self.labels = self.adata.obs['gt_clusters']
+
+                
+            if gene_list is None:
+                self.gene_list = list(np.load('./data/dlpfc_hvg_cut_1000.npy', allow_pickle=True))
+                        
+            # Process expression data
+            if self.norm:
+                self.exp_data = sc.pp.scale(
+                    scp.transform.log(
+                        scp.normalize.library_size_normalize(
+                            self.adata[:, self.gene_list].X
+                        )
+                    )
+                )
+            else:
+                self.exp_data = scp.transform.log(
+                    scp.normalize.library_size_normalize(
+                        self.adata[:, self.gene_list].X
+                    )
+                )
+                
+            self.n_clusters = len(np.unique(self.labels))
+            self.n_pos = self.spatial.max() + 1
+
+            # Calculate adjacency matrix
+            self.adj = calcADJ(coord=self.spatial, k=4, pruneTag='NA')
+                
+                
+        elif dataset == 'BRCA':
+            print('Not implemented yet!')
+        else:
+            raise ValueError('Dataset not supported!')
+
+        
+
+    def __len__(self):
+        return len(self.labels)
+    
+    def __getitem__(self, index):
+        patch = self.patches[index]
+        position = torch.LongTensor(self.spatial[index])        
+        exp = torch.Tensor(self.exp_data[index])
+
+        # Apply augmentation if needed
+        if self.aug and self.train:
+            patch = Image.fromarray(patch)
+            patch = self.transforms(patch)
+            patch = patch.permute(2, 1, 0)
+        else:
+            patch = torch.Tensor(patch).permute(2, 0, 1)
+            
+        
+        if self.train:
+            return patch, position, exp, self.adj
+        else:
+            center = torch.Tensor(self.spatial[index])
+            return patch, position, exp, center, self.adj
+        
+    def get_img(self, section_id):
+        # path = f'{self.dir}/{section_id}/{section_id}_full_image.tif'
+        # path = os.path.join(self.dir, section_id, 'spatial', 'tissue_hires_image.png')
+        
+        # Use new path because the current one may have damaged tif images
+        path = os.path.join('data/st_data/DLPFC_new/', section_id, 'spatial', section_id+'_full_image.tif')
+        # im = Image.open(path)
+        im = cv2.imread(path)
+        im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
+        return im
+
+    def get_meta(self, section_id, gene_list=None):
+        meta = pd.read_csv(f'{self.dir}{section_id}/metadata.tsv', index_col=0, sep='\t')
+        return meta
+    
+    def get_adata(self, section_id):
+        h5_path = os.path.join(self.dir, section_id)
+        adata = sc.read_visium(h5_path, count_file=section_id+'_filtered_feature_bc_matrix.h5', load_images=True)
+        adata.var_names_make_unique()
+        
+        gt_df = self.get_labels(section_id)
+        adata.obs['gt_clusters'] = gt_df.loc[:, 6] # Last column
+        
+        # Drop na
+        adata = adata[adata.obs.dropna().index].copy()
+        adata.obs['gt_clusters'] = adata.obs['gt_clusters'].astype(int).astype(str)
+        
+        return adata
+    
+    def get_spatial_positions(self, section_id):
+        pos_path = os.path.join(self.dir, section_id, 'spatial', 'tissue_positions_list.csv')
+        positions = pd.read_csv(pos_path, header=None, index_col=0)
+        positions.columns = ['barcode', 'in_tissue', 'array_row', 'array_col', 'pxl_col_in_fullres', 'pxl_row_in_fullres']
+        return positions
+
+    def get_overlap(self, meta_dict, gene_list):
+        gene_set = set(gene_list)
+        for i in meta_dict.values():
+            gene_set = gene_set & set(i.columns)
+        return list(gene_set)
+    
+    def get_labels(self, section_id):
+        gt_dir = os.path.join(self.dir, section_id, 'gt')
+        gt_df = pd.read_csv(os.path.join(gt_dir, 'tissue_positions_list_GTs.txt'),
+                            header=None, sep=',', index_col=0)
+        return gt_df
+
+         

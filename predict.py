@@ -3,7 +3,7 @@ import numpy as np
 import scanpy as sc
 import anndata as ad
 from tqdm import tqdm
-from dataset import ViT_HER2ST, ViT_SKIN, ViT_DLPFC
+from dataset import ViT_HER2ST, ViT_SKIN, ViT_DLPFC, MyDataset
 from scipy.stats import pearsonr,spearmanr
 from sklearn.cluster import KMeans
 from sklearn.metrics import adjusted_rand_score as ari_score
@@ -22,8 +22,8 @@ def pk_load(fold,mode='train',flatten=False,dataset='her2st',r=4,ori=True,adj=Tr
             ori=ori,neighs=neighs,adj=adj,prune=prune,r=r
         )
     elif dataset=='dlpfc':
-        dataset = ViT_DLPFC(
-            train=(mode=='train'),fold=fold,
+        dataset = MyDataset(
+            train=(mode=='train'), dataset=dataset, section_id=fold
         )
     return dataset
 
