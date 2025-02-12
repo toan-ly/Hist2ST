@@ -12,6 +12,7 @@ import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
+import scipy
 import torchvision.transforms as transforms
 from PIL import ImageFile, Image
 import cv2
@@ -573,40 +574,59 @@ class MyDataset(torch.utils.data.Dataset):
             # Load data
             print('Loading data...')
             self.adata = self.get_adata(section_id)
+            
+            print('Loading image...')
             full_img = np.array(self.get_img(section_id))
 
             self.spatial = self.adata.obsm['spatial']
+
+            print('Extracting patches...')
             self.patches = np.array([
-                full_img[x - self.r:x + self.r, y - self.r:y + self.r, :]
+                full_img[y - self.r:y + self.r, x - self.r:x + self.r, :]
                 for x, y in self.spatial
             ])
             self.labels = self.adata.obs['gt_clusters']
-
                 
             if gene_list is None:
                 self.gene_list = list(np.load('./data/dlpfc_hvg_cut_1000.npy', allow_pickle=True))
                         
-            # Process expression data
+            expression_matrix = self.adata[:, self.gene_list].X
+            # Convert sparse matrix to dense if needed
+            if scipy.sparse.issparse(expression_matrix):
+                expression_matrix = expression_matrix.toarray()
+            
+            # Normalize and process
             if self.norm:
                 self.exp_data = sc.pp.scale(
                     scp.transform.log(
                         scp.normalize.library_size_normalize(
-                            self.adata[:, self.gene_list].X
+                            expression_matrix
                         )
                     )
                 )
             else:
                 self.exp_data = scp.transform.log(
                     scp.normalize.library_size_normalize(
-                        self.adata[:, self.gene_list].X
+                        expression_matrix
                     )
                 )
                 
+            # Ensure exp_data is dense numpy array
+            self.exp_data = np.array(self.exp_data)
+
+            self.loc = self.adata.obs[['array_row', 'array_col']].values
             self.n_clusters = len(np.unique(self.labels))
             self.n_pos = self.spatial.max() + 1
 
             # Calculate adjacency matrix
-            self.adj = calcADJ(coord=self.spatial, k=4, pruneTag='NA')
+            self.adj = calcADJ(coord=self.loc, k=4, pruneTag='NA')
+            
+            print(self.patches.shape)
+            # print(self.loc_dict)
+            # print(self.adj)
+            # print(self.exp_data)
+            
+            print('Done!')
                 
                 
         elif dataset == 'BRCA':
@@ -620,23 +640,23 @@ class MyDataset(torch.utils.data.Dataset):
         return len(self.labels)
     
     def __getitem__(self, index):
-        patch = self.patches[index]
-        position = torch.LongTensor(self.spatial[index])        
-        exp = torch.Tensor(self.exp_data[index])
+        patch = self.patches
+        position = torch.LongTensor(self.loc)        
+        exp = torch.Tensor(self.exp_data)
 
         # Apply augmentation if needed
         if self.aug and self.train:
             patch = Image.fromarray(patch)
             patch = self.transforms(patch)
-            patch = patch.permute(2, 1, 0)
+            patch = patch.permute(0, 3, 2, 1)
         else:
-            patch = torch.Tensor(patch).permute(2, 0, 1)
+            patch = torch.Tensor(patch).permute(0, 3, 1, 2)
             
         
         if self.train:
             return patch, position, exp, self.adj
         else:
-            center = torch.Tensor(self.spatial[index])
+            center = torch.Tensor(self.spatial)
             return patch, position, exp, center, self.adj
         
     def get_img(self, section_id):
