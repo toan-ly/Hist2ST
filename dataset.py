@@ -571,60 +571,105 @@ class MyDataset(torch.utils.data.Dataset):
         if dataset.lower() == 'dlpfc':
             self.dir = './data/st_data/DLPFC12/'
             
+            sample_names = ['151507', '151508', '151509', '151510', '151669', '151670', '151671', '151672', '151673',
+                        '151674', '151675', '151676']
+            
+            
+            te_names = [section_id]
+            tr_names = list(set(sample_names) - set(te_names))
+            names = tr_names if train else te_names
+
             # Load data
             print('Loading data...')
-            self.adata = self.get_adata(section_id)
+            self.adata_dict = {i: self.get_adata(i) for i in names}
             
             print('Loading image...')
-            full_img = np.array(self.get_img(section_id))
+            # full_img = np.array(self.get_img(section_id))
+            if self.aug:
+                self.img_dict = {i: self.get_img(i) for i in names}
+            else:
+                self.img_dict = {i: torch.Tensor(np.array(self.get_img(i))) for i in names}
 
-            self.spatial = self.adata.obsm['spatial']
+            # self.spatial = self.adata.obsm['spatial']
+            self.spatial = {i: self.adata_dict[i].obsm['spatial'] for i in names}
 
             print('Extracting patches...')
-            self.patches = np.array([
-                full_img[y - self.r:y + self.r, x - self.r:x + self.r, :]
-                for x, y in self.spatial
-            ])
-            self.labels = self.adata.obs['gt_clusters']
+            self.patch_dict = {}
+
+            # self.patches = np.array([
+            #     self.full_img[y - self.r:y + self.r, x - self.r:x + self.r, :]
+            #     for x, y in self.spatial
+            # ])
+            self.labels = {i: self.adata_dict[i].obs['gt_clusters'] for i in names}
                 
             if gene_list is None:
-                self.gene_list = list(np.load('./data/dlpfc_hvg_cut_1000.npy', allow_pickle=True))
+                self.gene_set = list(np.load('./data/dlpfc_hvg_cut_1000.npy', allow_pickle=True))
                         
-            expression_matrix = self.adata[:, self.gene_list].X
-            # Convert sparse matrix to dense if needed
-            if scipy.sparse.issparse(expression_matrix):
-                expression_matrix = expression_matrix.toarray()
+            # expression_matrix = {i: self.adata[i][:, self.gene_list].X for i in names}
+            # # Convert sparse matrix to dense if needed
+            # if scipy.sparse.issparse(expression_matrix):
+            #     expression_matrix = expression_matrix.toarray()
             
-            # Normalize and process
+            # # Normalize and process
+            # if self.norm:
+            #     self.exp_data = sc.pp.scale(
+            #         scp.transform.log(
+            #             scp.normalize.library_size_normalize(
+            #                 expression_matrix
+            #             )
+            #         )
+            #     )
+            # else:
+            #     self.exp_data = scp.transform.log(
+            #         scp.normalize.library_size_normalize(
+            #             expression_matrix
+            #         )
+            #     )
+            
+            # Process expression data
             if self.norm:
-                self.exp_data = sc.pp.scale(
-                    scp.transform.log(
-                        scp.normalize.library_size_normalize(
-                            expression_matrix
+                self.exp_dict = {
+                    i: sc.pp.scale(
+                        scp.transform.log(
+                            scp.normalize.library_size_normalize(
+                                adata[:, self.gene_set].X.toarray() if scipy.sparse.issparse(adata[:, self.gene_set].X) 
+                                else adata[:, self.gene_set].X
+                            )
                         )
-                    )
-                )
+                    ) for i, adata in self.adata_dict.items()
+                }
             else:
-                self.exp_data = scp.transform.log(
-                    scp.normalize.library_size_normalize(
-                        expression_matrix
-                    )
-                )
+                self.exp_dict = {
+                    i: scp.transform.log(
+                        scp.normalize.library_size_normalize(
+                            adata[:, self.gene_set].X.toarray() if scipy.sparse.issparse(adata[:, self.gene_set].X) 
+                            else adata[:, self.gene_set].X
+                        )
+                    ) for i, adata in self.adata_dict.items()
+                }
                 
             # Ensure exp_data is dense numpy array
-            self.exp_data = np.array(self.exp_data)
+            self.exp_dict = {i: np.array(exp_data) for i, exp_data in self.exp_dict.items()}
 
-            self.loc = self.adata.obs[['array_row', 'array_col']].values
+            self.center_dict = {i: np.floor(adata.obsm['spatial']).astype(int) for i, adata in self.adata_dict.items()}
+            # self.loc = self.adata.obs[['array_row', 'array_col']].values
+            self.loc_dict = {i: adata.obs[['array_row', 'array_col']].values for i, adata in self.adata_dict.items()}
+
+            self.lengths = [len(adata) for adata in self.adata_dict.values()]
+            self.cumlen = np.cumsum(self.lengths)
             self.n_clusters = len(np.unique(self.labels))
-            self.n_pos = self.spatial.max() + 1
+            # self.n_pos = self.spatial.max() + 1
+            self.id2name = dict(enumerate(names))
 
             # Calculate adjacency matrix
-            self.adj = calcADJ(coord=self.loc, k=4, pruneTag='NA')
+            # self.adj = calcADJ(coord=self.loc, k=4, pruneTag='NA')
+            self.adj_dict = {i: calcADJ(coord=loc, k=4, pruneTag='NA') for i, loc in self.loc_dict.items()}
             
-            print(self.patches.shape)
+            # print(self.patch_dict)
             # print(self.loc_dict)
-            # print(self.adj)
-            # print(self.exp_data)
+            # print(self.adj_dict)
+            # print(self.center_dict)
+            # print(self.adata_dict)
             
             print('Done!')
                 
@@ -634,30 +679,46 @@ class MyDataset(torch.utils.data.Dataset):
         else:
             raise ValueError('Dataset not supported!')
 
-        
-
     def __len__(self):
         return len(self.labels)
     
     def __getitem__(self, index):
-        patch = self.patches
-        position = torch.LongTensor(self.loc)        
-        exp = torch.Tensor(self.exp_data)
+        name = self.id2name[index]
+        im = self.img_dict[name]
+        # patch = self.patches
+        # position = torch.LongTensor(self.loc)        
+        # exp = torch.Tensor(self.exp_data)
 
         # Apply augmentation if needed
-        if self.aug and self.train:
-            patch = Image.fromarray(patch)
-            patch = self.transforms(patch)
-            patch = patch.permute(0, 3, 2, 1)
+        if self.aug:
+            im = self.transforms(im)
+            im = im.permute(2, 1, 0)
         else:
-            patch = torch.Tensor(patch).permute(0, 3, 1, 2)
+            im = im.permute(1, 0, 2)
             
+        exps = self.exp_dict[name]   
+        centers = self.center_dict[name]
+        loc = self.loc_dict[name]
+        positions = torch.LongTensor(loc)
         
-        if self.train:
-            return patch, position, exp, self.adj
+        n_patches = len(centers)
+         
+        if name in self.patch_dict:
+            patches = self.patch_dict[name]
         else:
-            center = torch.Tensor(self.spatial)
-            return patch, position, exp, center, self.adj
+            patches = torch.zeros((n_patches, 3, 2 * self.r, 2 * self.r))
+            for i in range(n_patches):
+                center = centers[i]
+                x, y = center
+                patch = im[(y - self.r):(y + self.r), (x - self.r):(x + self.r), :]
+                patches[i] = patch.permute(2, 0, 1)
+            self.patch_dict[name] = patches
+            
+        adj = self.adj_dict[name]
+        if self.train:
+            return patches, positions, exps, adj
+        else:
+            return patches, positions, exps, torch.Tensor(centers), adj
         
     def get_img(self, section_id):
         # path = f'{self.dir}/{section_id}/{section_id}_full_image.tif'
@@ -665,6 +726,7 @@ class MyDataset(torch.utils.data.Dataset):
         
         # Use new path because the current one may have damaged tif images
         path = os.path.join('data/st_data/DLPFC_new/', section_id, 'spatial', section_id+'_full_image.tif')
+        # print(path)
         # im = Image.open(path)
         im = cv2.imread(path)
         im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
@@ -675,6 +737,7 @@ class MyDataset(torch.utils.data.Dataset):
         return meta
     
     def get_adata(self, section_id):
+        print(f'Loading {section_id}...')
         h5_path = os.path.join(self.dir, section_id)
         adata = sc.read_visium(h5_path, count_file=section_id+'_filtered_feature_bc_matrix.h5', load_images=True)
         adata.var_names_make_unique()
